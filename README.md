@@ -4,6 +4,11 @@ This is a Tampermonkey userscript for collecting book-page images from an
 Archive.org book reader and downloading the collected pages as numbered ZIP
 files.
 
+Current version: **1.6**
+
+Version 1.6 adds automatic stopping when the reader reaches the final page or
+the page counter restarts, along with a Stop control for manual interruption.
+
 ## How to install
 
 1. Install the Tampermonkey browser extension.
@@ -25,6 +30,9 @@ browser must be able to load that external library.
 7. After zooming completes, it clicks the reader's `Flip right` button, waits 5 seconds for the new page to load, and repeats automatically.
 8. Every 20 captured pages are removed from the pending memory list, packaged
    into a ZIP, and downloaded automatically.
+9. Automatic flipping stops when the reader reports the final page, or when its
+   page number moves backward because the reader has restarted from the first
+   page. Any remaining pending pages are downloaded as the final ZIP part.
 
 The zoom sequence runs automatically only once when the script initializes.
 Page flipping starts only after zooming and its 5-second settling wait finish.
@@ -37,6 +45,7 @@ remaining pages are downloaded as a final smaller ZIP part.
 
 - **Pages captured**: total number of unique JPEG images captured during this run.
 - **Pending memory**: approximate memory used by pages waiting to be put into a ZIP. Completed batches are released from this list.
+- **Stop**: stops zooming and automatic page flipping, and stops capturing new reader images. Pages already pending can still be downloaded with **Download ZIP**.
 - **Download ZIP**: manually downloads any currently pending pages as the next numbered ZIP part.
 - **Clear**: removes all captured pages and resets the counter.
 
@@ -61,6 +70,8 @@ seconds so the browser can release that ZIP's memory.
 - If the Zoom in button is not available in the current document, the script logs a warning and continues without changing the zoom level.
 - If the next-page button disappears or becomes disabled, automatic page
   flipping stops.
+- Automatic page flipping also stops when `.BRcurrentpage` reports the final
+  page, such as `Page — (403/403)`, or when the page number wraps backward.
 - Clicking **Download ZIP** with no pending pages shows `No pages captured yet.`
 
 ## Troubleshooting

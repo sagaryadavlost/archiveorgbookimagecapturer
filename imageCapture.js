@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Archive.org Book Image Capturer - Reliable
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @description  Reliable capture (no corruption) with best-effort request order
 // @author       Grok
 // @match        https://archive.org/details/*
@@ -22,6 +22,7 @@
         ZOOM_CLICK_DELAY_MS: 1000,
         ZOOM_FINISH_DELAY_MS: 5000,
         NEXT_PAGE_SELECTOR: 'button.BRicon.book_right.book_flip_next',
+        CURRENT_PAGE_SELECTOR: '.BRcurrentpage',
         PAGE_FLIP_DELAY_MS: 5000,
         ZIP_MEMORY_RELEASE_DELAY_MS: 10000
     };
@@ -32,6 +33,8 @@
     let totalCapturedPages = 0;
     let nextZipPart = 1;
     let zipQueue = Promise.resolve();
+    let isRunning = true;
+    let originalCreateObjectURL = null;
 
     async function ensureJSZip() {
         if (typeof JSZip !== 'undefined') return JSZip;
@@ -60,13 +63,13 @@
 
     // === MAIN INTERCEPTOR (Most Reliable) ===
     function interceptCreateObjectURL() {
-        const original = URL.createObjectURL;
+        originalCreateObjectURL = URL.createObjectURL;
 
         URL.createObjectURL = function (obj) {
             if (obj instanceof Blob && obj.type === 'image/jpeg' && obj.size > 2000) {
                 handleImageBlob(obj);
             }
-            return original.call(URL, obj);
+            return originalCreateObjectURL.call(URL, obj);
         };
     }
 
@@ -116,13 +119,16 @@
 
         panel.innerHTML = `
             <strong>📖 IA Book Capturer (Reliable)</strong><br>
+            Status: <b>${isRunning ? 'Running' : 'Stopped'}</b><br>
             Pages captured: <b>${count}</b><br>
             Pending memory: <b>${mem} MB</b><br><br>
             <button id="btn-zip" style="padding:10px 16px;margin:4px;background:#0f0;color:#000;border:none;border-radius:4px;cursor:pointer;font-weight:bold;">📥 Download ZIP</button>
+            <button id="btn-stop" style="padding:10px 16px;margin:4px;background:#ff9800;color:#000;border:none;border-radius:4px;cursor:pointer;font-weight:bold;">Stop</button>
             <button id="btn-clear" style="padding:10px 16px;margin:4px;background:#c00;color:white;border:none;border-radius:4px;cursor:pointer;">Clear</button>
         `;
 
         panel.querySelector('#btn-zip').onclick = downloadAsZip;
+        panel.querySelector('#btn-stop').onclick = stopCapture;
         panel.querySelector('#btn-clear').onclick = clearAll;
     }
 
@@ -195,6 +201,16 @@
         updatePanel();
     }
 
+    function stopCapture() {
+        isRunning = false;
+        if (originalCreateObjectURL) {
+            URL.createObjectURL = originalCreateObjectURL;
+            originalCreateObjectURL = null;
+        }
+        console.log('[IA Capturer] Capture stopped by user.');
+        updatePanel();
+    }
+
     function waitForZoomButton(timeoutMs = 30000) {
         return new Promise(resolve => {
             const startedAt = Date.now();
@@ -208,6 +224,17 @@
         });
     }
 
+    function getPagePosition() {
+        const pageElement = document.querySelector(CONFIG.CURRENT_PAGE_SELECTOR);
+        const match = pageElement?.textContent.match(/\((\d+)\s*\/\s*(\d+)\)/);
+        if (!match) return null;
+
+        return {
+            current: Number(match[1]),
+            total: Number(match[2])
+        };
+    }
+
     async function zoomInBeforeCapture() {
         const zoomButton = await waitForZoomButton();
         if (!zoomButton) {
@@ -216,17 +243,36 @@
         }
 
         for (let clickNumber = 0; clickNumber < CONFIG.ZOOM_CLICKS; clickNumber++) {
+            if (!isRunning) return false;
             zoomButton.click();
             await new Promise(resolve => setTimeout(resolve, CONFIG.ZOOM_CLICK_DELAY_MS));
         }
 
+        if (!isRunning) return false;
         await new Promise(resolve => setTimeout(resolve, CONFIG.ZOOM_FINISH_DELAY_MS));
+        if (!isRunning) return false;
         console.log('[IA Capturer] Finished zooming in and waiting for the page to settle.');
         return true;
     }
 
     async function flipPagesAutomatically() {
-        while (true) {
+        let previousPage = null;
+
+        while (isRunning) {
+            const pagePosition = getPagePosition();
+            if (pagePosition && (pagePosition.current >= pagePosition.total ||
+                (previousPage !== null && pagePosition.current < previousPage))) {
+                stopCapture();
+                console.log(`[IA Capturer] Stopped page flipping at page ${pagePosition.current}/${pagePosition.total}.`);
+                if (capturedBlobs.length > 0) {
+                    const finalBatch = capturedBlobs.splice(0, capturedBlobs.length);
+                    queueZipDownload(finalBatch);
+                    updatePanel();
+                }
+                return;
+            }
+            if (pagePosition) previousPage = pagePosition.current;
+
             const nextPageButton = document.querySelector(CONFIG.NEXT_PAGE_SELECTOR);
             if (!nextPageButton || nextPageButton.disabled || nextPageButton.getAttribute('aria-disabled') === 'true') {
                 console.log('[IA Capturer] Stopped page flipping: next-page button is unavailable.');
@@ -250,9 +296,9 @@
         createStatusPanel();
         updatePanel();
         zoomInBeforeCapture().then(zoomCompleted => {
-            if (zoomCompleted) flipPagesAutomatically();
+            if (zoomCompleted && isRunning) flipPagesAutomatically();
         });
-        console.log('%c[IA Reliable Capturer v1.4] Loaded', 'color:lime;font-weight:bold');
+        console.log('%c[IA Reliable Capturer v1.6] Loaded', 'color:lime;font-weight:bold');
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

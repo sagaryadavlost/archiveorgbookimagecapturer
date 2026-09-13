@@ -74,6 +74,8 @@
     }
 
     async function handleImageBlob(blob) {
+        // Reserve the number when capture starts, before hashing can reorder callbacks.
+        const sequenceNum = nextNum++;
         const hash = await getHash(blob);
 
         if (seenHashes.has(hash)) return; // duplicate
@@ -82,7 +84,7 @@
 
         capturedBlobs.push({
             blob: blob,
-            sequenceNum: nextNum++
+            sequenceNum: sequenceNum
         });
         totalCapturedPages++;
 
@@ -149,6 +151,8 @@
 
     async function downloadBatchAsZip(batch, partNumber) {
         if (batch.length === 0) return;
+
+        batch.sort((left, right) => left.sequenceNum - right.sequenceNum);
 
         const JSZip = await ensureJSZip();
         if (!JSZip) return alert("JSZip not loaded.");

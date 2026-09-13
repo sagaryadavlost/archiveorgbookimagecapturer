@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Archive.org Book Image Capturer - Reliable
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Reliable capture (no corruption) with best-effort request order
 // @author       Grok
 // @match        https://archive.org/details/*
@@ -15,13 +15,23 @@
 
     const CONFIG = {
         PANEL_ID: 'ia-book-capturer',
-        ZIP_FILENAME: 'archive_org_book.zip'
+        ZIP_FILENAME_PREFIX: 'archive_org_book_part',
+        PAGE_BATCH_SIZE: 20,
+        ZOOM_SELECTOR: 'button.BRicon.zoom_in',
+        ZOOM_CLICKS: 6,
+        ZOOM_CLICK_DELAY_MS: 1000,
+        ZOOM_FINISH_DELAY_MS: 5000,
+        NEXT_PAGE_SELECTOR: 'button.BRicon.book_right.book_flip_next',
+        PAGE_FLIP_DELAY_MS: 5000,
+        ZIP_MEMORY_RELEASE_DELAY_MS: 10000
     };
 
     let capturedBlobs = []; // {blob, sequenceNum}
     let seenHashes = new Set();
     let nextNum = 1;
-    let JSZipLib = null;
+    let totalCapturedPages = 0;
+    let nextZipPart = 1;
+    let zipQueue = Promise.resolve();
 
     async function ensureJSZip() {
         if (typeof JSZip !== 'undefined') return JSZip;
@@ -71,9 +81,16 @@
             blob: blob,
             sequenceNum: nextNum++
         });
+        totalCapturedPages++;
 
-        console.log(`[IA Capturer] Captured page ${capturedBlobs.length} (${(blob.size/1024).toFixed(1)} KB)`);
+        console.log(`[IA Capturer] Captured page ${totalCapturedPages} (${(blob.size/1024).toFixed(1)} KB)`);
         updatePanel();
+
+        if (capturedBlobs.length >= CONFIG.PAGE_BATCH_SIZE) {
+            const batch = capturedBlobs.splice(0, CONFIG.PAGE_BATCH_SIZE);
+            queueZipDownload(batch);
+            updatePanel();
+        }
     }
 
     // UI
@@ -94,13 +111,13 @@
 
     function updatePanel() {
         const panel = createStatusPanel();
-        const count = capturedBlobs.length;
+        const count = totalCapturedPages;
         const mem = Math.round(capturedBlobs.reduce((s, i) => s + i.blob.size, 0) * 1.05 / (1024*1024) * 100) / 100;
 
         panel.innerHTML = `
             <strong>📖 IA Book Capturer (Reliable)</strong><br>
-            Pages: <b>${count}</b><br>
-            Memory: <b>${mem} MB</b><br><br>
+            Pages captured: <b>${count}</b><br>
+            Pending memory: <b>${mem} MB</b><br><br>
             <button id="btn-zip" style="padding:10px 16px;margin:4px;background:#0f0;color:#000;border:none;border-radius:4px;cursor:pointer;font-weight:bold;">📥 Download ZIP</button>
             <button id="btn-clear" style="padding:10px 16px;margin:4px;background:#c00;color:white;border:none;border-radius:4px;cursor:pointer;">Clear</button>
         `;
@@ -112,16 +129,31 @@
     async function downloadAsZip() {
         if (capturedBlobs.length === 0) return alert("No pages captured yet.");
 
+        const batch = capturedBlobs.splice(0, capturedBlobs.length);
+        queueZipDownload(batch);
+        updatePanel();
+    }
+
+    function queueZipDownload(batch) {
+        const partNumber = nextZipPart++;
+        zipQueue = zipQueue
+            .then(() => downloadBatchAsZip(batch, partNumber))
+            .catch(error => console.error('[IA Capturer] ZIP creation failed:', error));
+    }
+
+    async function downloadBatchAsZip(batch, partNumber) {
+        if (batch.length === 0) return;
+
         const JSZip = await ensureJSZip();
         if (!JSZip) return alert("JSZip not loaded.");
 
         const zip = new JSZip();
-        const loading = showLoading(`Creating ZIP (${capturedBlobs.length} pages)...`);
+        const loading = showLoading(`Creating ZIP part ${partNumber} (${batch.length} pages)...`);
 
         try {
             // Already in capture order
-            for (let i = 0; i < capturedBlobs.length; i++) {
-                const item = capturedBlobs[i];
+            for (let i = 0; i < batch.length; i++) {
+                const item = batch[i];
                 const num = String(item.sequenceNum).padStart(4, '0');
                 zip.file(`page_${num}.jpg`, item.blob);
             }
@@ -131,9 +163,9 @@
             const url = URL.createObjectURL(zipBlob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = CONFIG.ZIP_FILENAME;
+            a.download = `${CONFIG.ZIP_FILENAME_PREFIX}_${String(partNumber).padStart(3, '0')}.zip`;
             a.click();
-            URL.revokeObjectURL(url);
+            setTimeout(() => URL.revokeObjectURL(url), CONFIG.ZIP_MEMORY_RELEASE_DELAY_MS);
 
         } catch (e) {
             console.error(e);
@@ -159,7 +191,56 @@
         capturedBlobs = [];
         seenHashes.clear();
         nextNum = 1;
+        totalCapturedPages = 0;
         updatePanel();
+    }
+
+    function waitForZoomButton(timeoutMs = 30000) {
+        return new Promise(resolve => {
+            const startedAt = Date.now();
+            const findButton = () => {
+                const button = document.querySelector(CONFIG.ZOOM_SELECTOR);
+                if (button) return resolve(button);
+                if (Date.now() - startedAt >= timeoutMs) return resolve(null);
+                setTimeout(findButton, 250);
+            };
+            findButton();
+        });
+    }
+
+    async function zoomInBeforeCapture() {
+        const zoomButton = await waitForZoomButton();
+        if (!zoomButton) {
+            console.warn('[IA Capturer] Zoom in button was not found.');
+            return false;
+        }
+
+        for (let clickNumber = 0; clickNumber < CONFIG.ZOOM_CLICKS; clickNumber++) {
+            zoomButton.click();
+            await new Promise(resolve => setTimeout(resolve, CONFIG.ZOOM_CLICK_DELAY_MS));
+        }
+
+        await new Promise(resolve => setTimeout(resolve, CONFIG.ZOOM_FINISH_DELAY_MS));
+        console.log('[IA Capturer] Finished zooming in and waiting for the page to settle.');
+        return true;
+    }
+
+    async function flipPagesAutomatically() {
+        while (true) {
+            const nextPageButton = document.querySelector(CONFIG.NEXT_PAGE_SELECTOR);
+            if (!nextPageButton || nextPageButton.disabled || nextPageButton.getAttribute('aria-disabled') === 'true') {
+                console.log('[IA Capturer] Stopped page flipping: next-page button is unavailable.');
+                if (capturedBlobs.length > 0) {
+                    const finalBatch = capturedBlobs.splice(0, capturedBlobs.length);
+                    queueZipDownload(finalBatch);
+                    updatePanel();
+                }
+                return;
+            }
+
+            nextPageButton.click();
+            await new Promise(resolve => setTimeout(resolve, CONFIG.PAGE_FLIP_DELAY_MS));
+        }
     }
 
     // Init
@@ -168,6 +249,9 @@
         interceptCreateObjectURL();
         createStatusPanel();
         updatePanel();
+        zoomInBeforeCapture().then(zoomCompleted => {
+            if (zoomCompleted) flipPagesAutomatically();
+        });
         console.log('%c[IA Reliable Capturer v1.4] Loaded', 'color:lime;font-weight:bold');
     }
 
